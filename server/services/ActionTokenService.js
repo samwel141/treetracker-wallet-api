@@ -3,6 +3,8 @@
  * authorizing a future transfer. The token itself stays stateless; a persisted
  * action_token row mirrors each issued link so the sender can list and revoke
  * outstanding links and redemption can reject cancelled/spent links (#846).
+ * Generation also excludes tokens already promised by other outstanding
+ * links, so two links in a row can't be issued for the same token (#847).
 */
 const jwt = require('jsonwebtoken');
 const uuid = require('uuid');
@@ -97,7 +99,44 @@ class ActionTokenService {
     };
   }
 
+  // Page through the wallet's tokens collecting ones not already promised by
+  // another outstanding link, until `count` are found or the wallet runs out.
+  async _selectAvailableTokens(walletLoginId, count, reservedTokenIds) {
+    const selected = [];
+    const pageSize = Math.max(count * 2, 50);
+    let offset = 0;
+
+    // Bound the scan: a very large wallet still terminates in finite pages.
+    for (let page = 0; page < 500 && selected.length < count; page += 1) {
+      const tokens = await this._tokenService.getTokens({
+        limit: pageSize,
+        offset,
+        walletLoginId,
+      });
+      if (tokens.length === 0) break;
+
+      tokens.forEach((token) => {
+        if (selected.length < count && !reservedTokenIds.has(token.id)) {
+          selected.push(token.id);
+        }
+      });
+
+      if (tokens.length < pageSize) break; // that was the last page
+      offset += pageSize;
+    }
+
+    return selected;
+  }
+
   async generate({ recipient_email, tokens, bundle }, walletLoginId) {
+    // Tokens already promised by this sender's other outstanding links must
+    // not be handed out again (#847), whether requested explicitly or drawn
+    // from a bundle.
+    const reservedTokenIds =
+      await this._actionTokenRepository.getActiveReservedTokenIds(
+        walletLoginId,
+      );
+
     let tokenIds;
 
     if (tokens) {
@@ -105,19 +144,27 @@ class ActionTokenService {
         tokens.map((id) => this._tokenService.getById({ id, walletLoginId })),
       );
       tokenIds = resolved.map((token) => token.id);
+      const alreadyReserved = tokenIds.filter((tid) =>
+        reservedTokenIds.has(tid),
+      );
+      if (alreadyReserved.length > 0) {
+        throw new HttpError(
+          409,
+          `Token(s) already committed to an outstanding share link: ${alreadyReserved.join(', ')}`,
+        );
+      }
     } else {
-      const resolved = await this._tokenService.getTokens({
-        limit: bundle.bundle_size,
-        offset: 0,
+      tokenIds = await this._selectAvailableTokens(
         walletLoginId,
-      });
-      if (resolved.length < bundle.bundle_size) {
+        bundle.bundle_size,
+        reservedTokenIds,
+      );
+      if (tokenIds.length < bundle.bundle_size) {
         throw new HttpError(
           409,
           `Wallet does not have ${bundle.bundle_size} tokens available`,
         );
       }
-      tokenIds = resolved.map((token) => token.id);
     }
 
     const id = uuid.v4();
